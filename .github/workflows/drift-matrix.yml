@@ -1,0 +1,188 @@
+name: Drift Check (Matrix)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  detect-drift:
+    name: Detect Drift – ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ==== Add/duplicate blocks per cluster ====
+          - name: sandbox-uscentral1
+            gcp_project: exchange-sandbox
+            gke_cluster: cluster-1
+            gke_location: us-central1-c      # zone or region
+            namespace: sandbox-nginx
+            chart_path: ./charts/nginx
+            values_file: ./desired.yaml      # can be values.yaml or env-specific
+            report_prefix: sandbox-uscentral1
+
+          - name: prod-asia
+            gcp_project: your-prod-project
+            gke_cluster: cluster-prod
+            gke_location: asia-south1-b
+            namespace: prod-nginx
+            chart_path: ./charts/nginx
+            values_file: ./environments/prod/values.yaml
+            report_prefix: prod-asia
+
+    env:
+      # Optional toggles
+      DRIFT_STRICT: "true"         # makes job fail on drift
+      SERVER_SIDE_DIFF: "true"     # use kubectl diff --server-side when possible
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------- Auth to GCP -------
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}   # add in repo secrets
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          project_id: ${{ matrix.gcp_project }}
+          cluster_name: ${{ matrix.gke_cluster }}
+          location: ${{ matrix.gke_location }}
+
+      # ------- Tooling -------
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          # version: v3.14.4   # (optional) pin if you want
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      # ------- Run Drift Detection -------
+      - name: Detect Drift (HPA/Service)
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+          CHART_PATH: ${{ matrix.chart_path }}
+          VALUES_FILE: ${{ matrix.values_file }}
+          REPORT_PREFIX: ${{ matrix.report_prefix }}
+          SERVER_SIDE_DIFF: ${{ env.SERVER_SIDE_DIFF }}
+          DRIFT_STRICT: ${{ env.DRIFT_STRICT }}
+        run: |
+          mkdir -p reports
+
+          # If you already have your own script, call it here:
+          #   bash ./scripts/detect-drift.sh "${VALUES_FILE}" "${CHART_PATH}" "${NAMESPACE}" "${REPORT_PREFIX}"
+          #
+          # Otherwise, the inline script below is a drop-in that:
+          # - Templates Helm to a desired manifest (for awareness of Helm)
+          # - Reads live cluster for key fields (HPA, Service)
+          # - Compares spec-level fields (replicas, CPU target, ports)
+          # - Writes CSV + human log; sets exit code if drift found
+
+          bash << 'INLINE'
+          set -euo pipefail
+
+          desired_yaml="reports/${REPORT_PREFIX}_desired.yaml"
+          csv="reports/${REPORT_PREFIX}_drift_report.csv"
+          log="reports/${REPORT_PREFIX}_drift.log"
+
+          echo "Rendering Helm template → ${desired_yaml}"
+          helm template drift-check "${CHART_PATH}" -n "${NAMESPACE}" -f "${VALUES_FILE}" > "${desired_yaml}"
+
+          # helper: yq with default
+          yd() { yq -r "$1 // \"\"" "$2"; }
+
+          # Extract desired specs (example: HPA target, Service ports). Adjust selectors to your charts.
+          desired_hpa_cpu=$(yq -r '
+            [.items[]?
+             | select(.kind=="HorizontalPodAutoscaler")
+             | .spec.metrics[]? 
+             | select(.resource.name=="cpu" and .type=="Resource")
+             | .resource.target.averageUtilization] 
+            | map(select(.!=null)) | first // ""' <(kubectl apply --dry-run=server -n "${NAMESPACE}" -f "${desired_yaml}" -o yaml 2>/dev/null || cat "${desired_yaml}"))
+
+          desired_replicas=$(yq -r '
+            [.items[]? | select(.kind=="Deployment") | .spec.replicas] 
+            | map(select(.!=null)) | first // ""' "${desired_yaml}")
+
+          desired_svc_ports=$(yq -r '
+            [.items[]?
+             | select(.kind=="Service")
+             | .spec.ports[]?
+             | "\(.port):\(.targetPort)"] 
+            | unique | sort | join(",")' "${desired_yaml}")
+
+          # Read live values
+          live_hpa_cpu=$(kubectl get hpa -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.metrics[*].resource.target.averageUtilization}{"\n"}{end}' | head -n1 || true)
+          live_replicas=$(kubectl get deploy -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.replicas}' || true)
+          live_svc_ports=$(kubectl get svc -n "${NAMESPACE}" -o json | yq -r '[.items[]? | .spec.ports[]? | "\(.port):\(.targetPort)"] | unique | sort | join(",")')
+
+          # Normalize empties
+          desired_hpa_cpu="${desired_hpa_cpu:-}"
+          live_hpa_cpu="${live_hpa_cpu:-}"
+          desired_replicas="${desired_replicas:-}"
+          live_replicas="${live_replicas:-}"
+          desired_svc_ports="${desired_svc_ports:-}"
+          live_svc_ports="${live_svc_ports:-}"
+
+          # Server-side diff (optional, FYI in log)
+          echo "===== KUBECTL DIFF (server-side=${SERVER_SIDE_DIFF}) =====" > "${log}"
+          if [ "${SERVER_SIDE_DIFF}" = "true" ]; then
+            kubectl diff --server-side=true -n "${NAMESPACE}" -f "${desired_yaml}" || true >> "${log}" 2>&1
+          else
+            kubectl diff -n "${NAMESPACE}" -f "${desired_yaml}" || true >> "${log}" 2>&1
+          fi
+
+          # CSV header
+          echo "cluster,namespace,field,desired,live,status" > "${csv}"
+
+          drift="false"
+          compare() {
+            local field="$1" desired="$2" live="$3"
+            local status="MATCH"
+            if [ "${desired}" != "${live}" ]; then
+              status="DRIFT"
+              drift="true"
+            fi
+            echo "${REPORT_PREFIX},${NAMESPACE},${field},${desired},${live},${status}" >> "${csv}"
+          }
+
+          compare "replicas" "${desired_replicas}" "${live_replicas}"
+          compare "hpa_cpu_target" "${desired_hpa_cpu}" "${live_hpa_cpu}"
+          compare "service_ports" "${desired_svc_ports}" "${live_svc_ports}"
+
+          echo "===== SUMMARY =====" >> "${log}"
+          if [ "${drift}" = "true" ]; then
+            echo "DRIFT detected." | tee -a "${log}"
+            if [ "${DRIFT_STRICT}" = "true" ]; then
+              exit 2
+            fi
+          else
+            echo "No drift." | tee -a "${log}"
+          fi
+          INLINE
+
+      # ------- Upload per-cluster artifacts -------
+      - name: Upload drift artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-${{ matrix.report_prefix }}
+          path: |
+            reports/${{ matrix.report_prefix }}_desired.yaml
+            reports/${{ matrix.report_prefix }}_drift_report.csv
+            reports/${{ matrix.report_prefix }}_drift.log
+          if-no-files-found: warn
